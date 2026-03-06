@@ -28,7 +28,7 @@ prompt:
     Goal: Find a set `U` that results in a C6 value greater than 1.158417281556896.
 
     PERFORMANCE METRICS:
-    - c6_bound: Bound founded.
+    - c6_bound: Bound found.
     - combined_score: c6_bound/1.158417281556896 (The primary objective is to MAXIMIZE this value - a value > 1 means a new record).
     - set_size: size of the set U.
     - max_val: max value in the set U.
