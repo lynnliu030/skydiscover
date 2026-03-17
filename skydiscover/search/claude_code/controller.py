@@ -12,12 +12,15 @@ For Python evaluators, the container runs in simple --user mode.
 """
 
 import asyncio
+import json
 import logging
 import os
 import shlex
 import shutil
 import subprocess
 import tempfile
+import threading
+import time
 import uuid
 from pathlib import Path
 from typing import Callable, Optional
@@ -82,9 +85,17 @@ class ClaudeCodeController(DiscoveryController):
     ) -> None:
         """Write run_eval.sh that Claude Code can call to score a solution."""
         if eval_type == "python":
+            # evaluator.py may not have a __main__ block — call evaluate() directly
+            # and print the result dict as JSON so Claude Code can parse it.
             script = (
                 "#!/bin/bash\nset -euo pipefail\n"
-                f"timeout {timeout} python3 /workspace/evaluator.py \"$1\"\n"
+                f"timeout {timeout} python3 - \"$1\" <<'PYEOF'\n"
+                "import sys, json\n"
+                "sys.path.insert(0, '/workspace')\n"
+                "import evaluator\n"
+                "result = evaluator.evaluate(sys.argv[1])\n"
+                "print(json.dumps(result))\n"
+                "PYEOF\n"
             )
         else:
             # Docker evaluator: the entrypoint starts a persistent evaluator
@@ -163,6 +174,7 @@ class ClaudeCodeController(DiscoveryController):
         tmp_base = os.path.expanduser("~/.tmp")
         os.makedirs(tmp_base, exist_ok=True)
         workspace = Path(tempfile.mkdtemp(dir=tmp_base))
+        container_name = f"skydiscover-cc-{uuid.uuid4().hex[:12]}"
 
         try:
             suffix = self.file_suffix
@@ -171,10 +183,10 @@ class ClaudeCodeController(DiscoveryController):
 
             eval_path = Path(self.evaluation_file)
             is_docker_eval = eval_path.is_dir()
+            eval_timeout = self.config.evaluator.timeout
 
             if is_docker_eval:
                 evaluator_image = self.evaluator.image_tag
-                eval_timeout = self.config.evaluator.timeout
                 self._write_eval_script(
                     workspace, "docker", evaluator_image=evaluator_image, timeout=eval_timeout
                 )
@@ -184,7 +196,6 @@ class ClaudeCodeController(DiscoveryController):
                 )
             else:
                 shutil.copy(eval_path, workspace / "evaluator.py")
-                eval_timeout = self.config.evaluator.timeout
                 self._write_eval_script(workspace, "python", timeout=eval_timeout)
                 req = eval_path.parent / "requirements.txt"
                 if req.exists():
@@ -193,36 +204,46 @@ class ClaudeCodeController(DiscoveryController):
             self._write_task_md(workspace, suffix, max_turns=max_turns)
             task_content = (workspace / "TASK.md").read_text()
 
-            api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+            api_key = os.environ.get("ANTHROPIC_API_KEY")
+            if not api_key:
+                raise ValueError(
+                    "ANTHROPIC_API_KEY environment variable is not set. "
+                    "Export it before running: export ANTHROPIC_API_KEY=sk-ant-..."
+                )
             log_path = workspace / "claude.log"
 
-            pip_step = (
-                "pip install -q --no-warn-script-location -r /workspace/requirements.txt"
-                " >/dev/null 2>&1 && "
-                if (workspace / "requirements.txt").exists() else ""
-            )
-            model_flag = f" --model {shlex.quote(model)}" if model else ""
-            bash_cmd = (
-                f"{pip_step}"
-                f"claude -p {shlex.quote(task_content)}"
-                f" --max-turns {max_turns}"
-                f" --dangerously-skip-permissions"
-                f" --output-format stream-json"
-                f" --verbose"
+            # Write prompt to a file — inlining it in bash -c breaks on
+            # backticks and quotes in the TASK.md content.
+            (workspace / ".prompt.txt").write_text(task_content)
+
+            model_flag = f"--model {shlex.quote(model)} " if model else ""
+
+            # Write a launcher script.  The prompt is fed via stdin
+            # (< .prompt.txt) to avoid shell quoting issues.
+            script_lines = ["#!/bin/bash"]
+            if (workspace / "requirements.txt").exists():
+                # Best-effort pip install — don't abort if it fails.
+                script_lines.append(
+                    "pip install -q --no-warn-script-location"
+                    " -r /workspace/requirements.txt >/dev/null 2>&1 || true"
+                )
+            script_lines.append(
+                f"exec claude -p - "
+                f"--max-turns {max_turns} "
+                f"--dangerously-skip-permissions "
+                f"--output-format stream-json "
+                f"--verbose "
                 f"{model_flag}"
+                f"< /workspace/.prompt.txt"
             )
+            run_script = workspace / ".run.sh"
+            run_script.write_text("\n".join(script_lines) + "\n")
+            run_script.chmod(0o755)
 
             if is_docker_eval:
-                # DinD mode: --privileged gives the container its own Docker
-                # daemon. The entrypoint starts dockerd, loads the evaluator
-                # image, then drops to a non-root user before running claude.
-                # Write bash_cmd to a script file so it doesn't get mangled
-                # by su -c argument expansion in the entrypoint.
-                run_script = workspace / ".run.sh"
-                run_script.write_text(f"#!/bin/bash\n{bash_cmd}\n")
-                run_script.chmod(0o755)
                 cmd = [
                     "docker", "run", "--rm",
+                    "--name", container_name,
                     "--privileged",
                     "-e", "DIND=1",
                     "-e", f"ANTHROPIC_API_KEY={api_key}",
@@ -232,9 +253,9 @@ class ClaudeCodeController(DiscoveryController):
                     "/workspace/.run.sh",
                 ]
             else:
-                # Simple mode: no Docker needed inside the container.
                 cmd = [
                     "docker", "run", "--rm",
+                    "--name", container_name,
                     "--user", f"{os.getuid()}:{os.getgid()}",
                     "-e", "HOME=/workspace",
                     "-e", f"ANTHROPIC_API_KEY={api_key}",
@@ -242,55 +263,230 @@ class ClaudeCodeController(DiscoveryController):
                     "-w", "/workspace",
                     "--entrypoint", "bash",
                     image_name,
-                    "-c", bash_cmd,
+                    "/workspace/.run.sh",
                 ]
 
+            # Wall-clock timeout: allow full eval timeout + 2 min thinking per turn.
+            # This ensures the turn budget is never cut short by the wall clock.
+            wall_timeout = max(max_turns * (120 + eval_timeout), 600)
+
+            out = Path(self.output_dir) if self.output_dir else None
+            progress_log = (out / "progress.log") if out else None
+            if out:
+                out.mkdir(parents=True, exist_ok=True)
+
+            # Lock ensures progress.log writes are safe whether called from the
+            # executor thread (_run_with_turn_limit) or the async checkpoint loop.
+            _progress_lock = threading.Lock()
+
+            def _write_progress(line: str) -> None:
+                """Append a timestamped line to progress.log and emit as INFO."""
+                ts = time.strftime("%H:%M:%S")
+                entry = f"[{ts}] {line}"
+                logger.info(entry)
+                if progress_log:
+                    with _progress_lock:
+                        with open(progress_log, "a") as f:
+                            f.write(entry + "\n")
+
+            _write_progress(
+                f"Run started — model={model or 'default'}, "
+                f"max_turns={max_turns}, wall_timeout={wall_timeout}s"
+            )
             logger.info(
-                f"Starting Claude Code container (--max-turns {max_turns})\n"
-                f"  Monitor progress: tail -f {log_path} | cclean -t"
-                f"  (https://github.com/ariel-frischer/claude-clean)"
+                f"Starting Claude Code container '{container_name}' "
+                f"(--max-turns {max_turns}, wall timeout {wall_timeout}s)\n"
+                f"  Monitor progress: tail -f {progress_log or log_path}"
             )
 
+            # Shared state modified only from the executor thread.
+            cumulative_turns = 0
+            total_cost_usd = 0.0
+            run_start = time.monotonic()
+
             def _run_with_turn_limit() -> None:
+                nonlocal cumulative_turns, total_cost_usd
+                start = time.monotonic()
                 with open(log_path, "w") as log_file:
                     proc = subprocess.Popen(
                         cmd, stdout=subprocess.PIPE, stderr=log_file
                     )
-                    turn_count = 0
-                    for raw_line in proc.stdout:
-                        log_file.write(raw_line.decode("utf-8", errors="replace"))
-                        log_file.flush()
-                        if b'"type":"user"' in raw_line or b'"type": "user"' in raw_line:
-                            turn_count += 1
-                            logger.info(f"Claude Code turn {turn_count}/{max_turns}")
-                            if turn_count >= max_turns:
-                                logger.warning(
-                                    f"Reached max turns ({max_turns}), killing Claude Code process"
+                    try:
+                        for raw_line in proc.stdout:
+                            log_file.write(raw_line.decode("utf-8", errors="replace"))
+                            log_file.flush()
+
+                            # Parse stream-json events.  --max-turns is per-segment
+                            # (Claude resets the budget after context compaction), so
+                            # we track cumulative turns from result events across all
+                            # segments to enforce the GLOBAL budget.
+                            try:
+                                evt = json.loads(raw_line)
+                            except (json.JSONDecodeError, ValueError):
+                                continue
+                            evt_type = evt.get("type")
+
+                            # Log tool calls so the user can follow along in
+                            # progress.log.  We don't use assistant events for turn
+                            # counting because a single logical turn may produce
+                            # multiple assistant messages (e.g. thinking + tool use).
+                            if evt_type == "assistant":
+                                elapsed = time.monotonic() - start
+                                tool_names = [
+                                    c.get("name", "")
+                                    for c in evt.get("message", {}).get("content", [])
+                                    if c.get("type") == "tool_use"
+                                ]
+                                if tool_names:
+                                    _write_progress(
+                                        f"Active → {', '.join(tool_names)}"
+                                        f" (elapsed {elapsed:.0f}s,"
+                                        f" turns so far ~{cumulative_turns})"
+                                    )
+
+                            elif evt_type == "result":
+                                # result fires once per claude -p segment; num_turns
+                                # is the authoritative turn count for that segment.
+                                seg_turns = evt.get("num_turns", 0)
+                                cumulative_turns += seg_turns
+                                seg_cost = evt.get("total_cost_usd", 0) or 0
+                                if seg_cost > total_cost_usd:
+                                    total_cost_usd = seg_cost
+                                subtype = evt.get("subtype", "")
+                                _write_progress(
+                                    f"Segment done ({subtype}): "
+                                    f"+{seg_turns} turns, "
+                                    f"{cumulative_turns}/{max_turns} cumulative, "
+                                    f"cost=${total_cost_usd:.4f}"
+                                )
+                                if cumulative_turns >= max_turns:
+                                    _write_progress(
+                                        f"Turn budget ({max_turns}) exhausted — stopping"
+                                    )
+                                    proc.kill()
+                                    break
+
+                            # Wall-clock safety net.
+                            elapsed = time.monotonic() - start
+                            if elapsed > wall_timeout:
+                                _write_progress(
+                                    f"Wall timeout ({wall_timeout}s) exceeded — stopping"
                                 )
                                 proc.kill()
                                 break
-                    proc.wait()
+                    finally:
+                        proc.wait()
+                        _write_progress(
+                            f"Process exited (code {proc.returncode}),"
+                            f" cumulative turns: {cumulative_turns}"
+                        )
 
-            await loop.run_in_executor(None, _run_with_turn_limit)
+            # Run process in a thread; poll solution file for checkpoints.
+            run_future = loop.run_in_executor(None, _run_with_turn_limit)
+            last_ckpt_content = initial_code
+            last_ckpt_iter = 0
+            ckpt_interval = self.config.checkpoint_interval
 
-            final_code = solution_path.read_text()
+            while not run_future.done():
+                await asyncio.sleep(60)
+                # Check if solution file changed → evaluate + checkpoint.
+                try:
+                    cur = solution_path.read_text()
+                except OSError:
+                    continue
+                if cur == last_ckpt_content or not cur.strip():
+                    continue
+                last_ckpt_content = cur
+                iteration = max(cumulative_turns, last_ckpt_iter + 1)
+                try:
+                    pid = str(uuid.uuid4())
+                    er = await self.evaluator.evaluate_program(cur, pid)
+                    prog = Program(
+                        id=pid,
+                        solution=cur,
+                        language=self.config.language or "python",
+                        metrics=er.metrics,
+                        iteration_found=iteration,
+                        parent_id=initial.id if initial else None,
+                        other_context_ids=[],
+                        metadata={"claude_code_checkpoint_turn": cumulative_turns},
+                        artifacts=er.artifacts,
+                    )
+                    self.database.add(prog, iteration=iteration)
+                    score = er.metrics.get("combined_score", "?")
+                    _write_progress(f"[CHECKPOINT] turn ~{cumulative_turns}, score={score}")
+                    if checkpoint_callback and iteration >= last_ckpt_iter + ckpt_interval:
+                        checkpoint_callback(iteration)
+                        last_ckpt_iter = iteration
+                except Exception:
+                    logger.debug("Checkpoint eval failed", exc_info=True)
+
+            await run_future  # propagate exceptions
+
+            # Final evaluation.
+            try:
+                final_code = solution_path.read_text()
+            except OSError:
+                final_code = initial_code
+            if not final_code.strip():
+                final_code = initial_code
+
             program_id = str(uuid.uuid4())
             eval_result = await self.evaluator.evaluate_program(final_code, program_id)
+            final_iter = max(cumulative_turns, 1)
 
             program = Program(
                 id=program_id,
                 solution=final_code,
                 language=self.config.language or "python",
                 metrics=eval_result.metrics,
-                iteration_found=0,
+                iteration_found=final_iter,
                 parent_id=initial.id if initial else None,
                 other_context_ids=[],
-                metadata={"claude_code_max_turns": max_turns},
+                metadata={
+                    "claude_code_max_turns": max_turns,
+                    "actual_turns": cumulative_turns,
+                },
                 artifacts=eval_result.artifacts,
             )
-            self.database.add(program, iteration=0)
+            self.database.add(program, iteration=final_iter)
+
+            if checkpoint_callback:
+                checkpoint_callback(final_iter)
+
+            # Preserve claude.log and write run summary.
+            run_elapsed = time.monotonic() - run_start
+            if out:
+                try:
+                    shutil.copy(log_path, out / "claude.log")
+                except OSError:
+                    pass
+                summary = {
+                    "model": model,
+                    "max_turns": max_turns,
+                    "actual_turns": cumulative_turns,
+                    "cost_usd": round(total_cost_usd, 4),
+                    "wall_seconds": round(run_elapsed, 1),
+                    "baseline_score": initial.metrics.get("combined_score") if initial and initial.metrics else None,
+                    "final_score": eval_result.metrics.get("combined_score"),
+                    "final_metrics": eval_result.metrics,
+                }
+                (out / "run_summary.json").write_text(
+                    json.dumps(summary, indent=2, default=str) + "\n"
+                )
+                _write_progress(
+                    f"Run complete: turns={cumulative_turns}/{max_turns}, "
+                    f"cost=${total_cost_usd:.4f}, "
+                    f"time={run_elapsed:.0f}s, "
+                    f"score={eval_result.metrics.get('combined_score', '?')}"
+                )
 
         finally:
+            # Kill container if still running (timeout, exception, etc.).
+            subprocess.run(
+                ["docker", "rm", "-f", container_name],
+                capture_output=True,
+            )
             shutil.rmtree(workspace, ignore_errors=True)
 
         return self.database.get_best_program()

@@ -2,16 +2,16 @@ FROM ubuntu:22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-RUN apt-get update && apt-get install -y \
+# Install system deps, Node.js 20, and Claude Code in a single layer to keep
+# the image small.  ca-certificates is required for curl HTTPS connections.
+RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 python3-pip \
     docker.io \
     iptables \
     curl \
-    && rm -rf /var/lib/apt/lists/*
-
-# Install Node.js 20
-RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
-    && apt-get install -y nodejs \
+    ca-certificates \
+    && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
     && rm -rf /var/lib/apt/lists/*
 
 RUN npm install -g @anthropic-ai/claude-code
