@@ -164,6 +164,24 @@ If no markers are present, the entire file is treated as mutatable.
 | 🧪&nbsp;**GEPA&nbsp;Native** | `--search gepa_native` | Pareto-efficient search with reflective prompting and LLM-mediated merge |
 | 🗺️&nbsp;**OpenEvolve&nbsp;Native** | `--search openevolve_native` | MAP-Elites + island-based evolutionary search |
 
+### Single-agent baseline
+
+| Algorithm | Flag | Description |
+|:---|:---|:---|
+| 🤖&nbsp;**Claude&nbsp;Code** | `--search claude_code` | Single-agent baseline: Claude Code CLI runs autonomously inside Docker, iterating on the solution directly |
+
+**Requirements:** Docker, `ANTHROPIC_API_KEY`. The runner image is built automatically on first use.
+
+```bash
+export ANTHROPIC_API_KEY=sk-ant-...
+skydiscover-run initial_program.py evaluator/ -c config.yaml -s claude_code -m claude-sonnet-4-6 -i 100
+```
+
+To reproduce all math benchmark results:
+```bash
+bash run_math_benchmarks.sh   # runs all 14 benchmarks in batches of 3
+```
+
 ### External backends
 
 Install with `uv sync --extra external`, then use the corresponding flag:
